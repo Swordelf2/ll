@@ -1,149 +1,126 @@
-//===-- examples/HowToUseJIT/HowToUseJIT.cpp - An example use of the JIT --===//
-//
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-//
-//  This small program provides an example of how to quickly build a small
-//  module with two functions and execute it with the JIT.
-//
-// Goal:
-//  The goal of this snippet is to create in the memory
-//  the LLVM module consisting of two functions as follow: 
-//
-// int add1(int x) {
-//   return x+1;
-// }
-//
-// int foo() {
-//   return add1(10);
-// }
-//
-// then compile the module via JIT, then execute the `foo'
-// function and return result to a driver, i.e. to a "host program".
-//
-// Some remarks and questions:
-//
-// - could we invoke some code using noname functions too?
-//   e.g. evaluate "foo()+foo()" without fears to introduce
-//   conflict of temporary function name with some real
-//   existing function name?
-//
-//===----------------------------------------------------------------------===//
-
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ExecutionEngine/ExecutionEngine.h"
-#include "llvm/ExecutionEngine/GenericValue.h"
-#include "llvm/IR/Argument.h"
-#include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
-#include "llvm/Support/Casting.h"
-#include "llvm/Support/ManagedStatic.h"
-#include "llvm/Support/TargetSelect.h"
+#include <llvm/IR/Module.h>
+#include <llvm/IRReader/IRReader.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/Support/SourceMgr.h>
 #include "llvm/Support/raw_ostream.h"
-#include <algorithm>
-#include <cassert>
-#include <memory>
-#include <vector>
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/Support/ManagedStatic.h"
+
+#include <utility>
+#include <cstdlib>
+#include <cstdint>
+#include <chrono>
+#include <pthread.h>
+
+#include <sqlite3.h>
+
 
 using namespace llvm;
 
-typedef int (* F)();
+// in Makefile
+// defined BITCODE_FILE as "filename.bc"
 
-int main() {
-  InitializeNativeTarget();
-  LLVMInitializeNativeAsmPrinter();
-  LLVMInitializeNativeAsmParser();
+struct Params {
+    ExecutionEngine* ee;
+};
 
-  LLVMContext Context;
+void *thread_routine(void *args) {
+    const Params *params = reinterpret_cast<Params *>(args);
+    params->ee->finalizeObject();
+    return 0x0;
+}
+    
+int main()
+{
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    LLVMInitializeNativeAsmParser();
+
+    outs() << "Is multithreaded: " << llvm::llvm_is_multithreaded() << '\n';
+
+    //outs() << "BITCODE_FILE = " #BITCODE_FILE << '\n';
+    LLVMContext context;
+    SMDiagnostic error;
+    auto module = parseIRFile(BITCODE_FILE, error, context);
+    if (module)
+    {
+        outs() << "Module generated\n";
+        //module->print(llvm::errs(), nullptr);
+    } else {
+        outs() << "ERROR\n";
+        error.print("PROGNAMEHERE", outs());
+        outs().flush();
+        abort();
+    }
+
+    outs() << "## Starting compilation ##\n\n";
+
+    /* Timer */
+    std::chrono::system_clock::time_point start_time_point;
+    start_time_point = std::chrono::system_clock::now();
+
+    EngineBuilder engineBuilder(std::move(module));
+    engineBuilder.setEngineKind(EngineKind::JIT);
+    ExecutionEngine* ee = engineBuilder.create();
+
+    pthread_t child_thread;
+    Params *thread_params = new Params { ee };
+    if (pthread_create(&child_thread, nullptr, thread_routine, reinterpret_cast<void *>(thread_params)) != 0) {
+        outs() << "Error while creating a thread\n";
+        abort();
+    }
+
+    // Loop while the thread has not terminated
+    uint64_t i = 0;
+    int result;
+    while ((result = pthread_tryjoin_np(child_thread, nullptr)) == EBUSY) {
+        ++i;
+    }
+    if (result != 0) {
+        outs() << "Error while joining with a thread\n";
+    }
+
+    /*
+    if (pthread_join(child_thread, nullptr) != 0) {
+        outs() << "Error while joining a thread\n";
+        abort();
+    }
+    */
+
+    outs() << "## Compilation finished ##\n";
+    outs() << "Errors: " << ee->getErrorMessage() << '\n';
+
+    outs() << "Value of i = " << i << '\n';
+
+    uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start_time_point).count();
+    outs() << "Time elapsed = " << ms / 1000 << '.' << ms % 1000 << " s\n";
+
+    /* TEST SQLITE */
+    
+    auto sqlite3_open = reinterpret_cast<int (*)(const char *, sqlite3 **)>(ee->getFunctionAddress("sqlite3_open"));
+    auto sqlite3_close = reinterpret_cast<int (*)(sqlite3 *)>(ee->getFunctionAddress("sqlite3_close"));
+    sqlite3* DB; 
+    int exit = 0; 
+    exit = sqlite3_open("example.db", &DB); 
   
-  // Create some module to put our function into it.
-  std::unique_ptr<Module> Owner = std::make_unique<Module>("test", Context);
-  Module *M = Owner.get();
+    if (exit) { 
+        outs() << "Error opening DB";
+        abort();
+    } 
+    else {
+        outs() << "Opened Database Successfully!" << '\n'; 
+    }
+    sqlite3_close(DB); 
 
-  // Create the add1 function entry and insert this entry into module M.  The
-  // function will have a return type of "int" and take an argument of "int".
-  Function *Add1F =
-      Function::Create(FunctionType::get(Type::getInt32Ty(Context),
-                                         {Type::getInt32Ty(Context)}, false),
-                       Function::ExternalLinkage, "add1", M);
+    /* test sqlite END */
+    /* TEST BCTEST
+    // Test by running a function
+    auto f = reinterpret_cast<int32_t (*)(int32_t)>(
+            ee->getFunctionAddress("foo"));
+    outs() << "Running foo(7) = " << f(7) << '\n';
+    */
 
-  // Add a basic block to the function. As before, it automatically inserts
-  // because of the last argument.
-  BasicBlock *BB = BasicBlock::Create(Context, "EntryBlock", Add1F);
-
-  // Create a basic block builder with default parameters.  The builder will
-  // automatically append instructions to the basic block `BB'.
-  IRBuilder<> builder(BB);
-
-  // Get pointers to the constant `1'.
-  Value *One = builder.getInt32(1);
-
-  // Get pointers to the integer argument of the add1 function...
-  assert(Add1F->arg_begin() != Add1F->arg_end()); // Make sure there's an arg
-  Argument *ArgX = &*Add1F->arg_begin();          // Get the arg
-  ArgX->setName("AnArg");            // Give it a nice symbolic name for fun.
-
-  // Create the add instruction, inserting it into the end of BB.
-  Value *Add = builder.CreateAdd(One, ArgX);
-
-  // Create the return instruction and add it to the basic block
-  builder.CreateRet(Add);
-
-  // Now, function add1 is ready.
-
-  // Now we're going to create function `foo', which returns an int and takes no
-  // arguments.
-  Function *FooF =
-      Function::Create(FunctionType::get(Type::getInt32Ty(Context), {}, false),
-                       Function::ExternalLinkage, "foo", M);
-
-  // Add a basic block to the FooF function.
-  BB = BasicBlock::Create(Context, "EntryBlock", FooF);
-
-  // Tell the basic block builder to attach itself to the new basic block
-  builder.SetInsertPoint(BB);
-
-  // Get pointer to the constant `10'.
-  Value *Ten = builder.getInt32(10);
-
-  // Pass Ten to the call to Add1F
-  CallInst *Add1CallRes = builder.CreateCall(Add1F, Ten);
-  Add1CallRes->setTailCall(true);
-
-  // Create the return instruction and add it to the basic block.
-  builder.CreateRet(Add1CallRes);
-
-  ExecutionEngine* EE = EngineBuilder(std::move(Owner)).create();
-
-  F f = reinterpret_cast<F>(EE->getFunctionAddress("foo"));
-  outs() << "We just constructed this LLVM module:\n\n" << *M << "\n\n";
-  outs() << f() << "\n";
-  /*
-  // Now we create the JIT.
-  ExecutionEngine* EE = EngineBuilder(std::move(Owner)).create();
-
-  outs() << "We just constructed this LLVM module:\n\n" << *M;
-  outs() << "\n\nRunning foo: ";
-  outs().flush();
-
-  // Call the `foo' function with no arguments:
-  std::vector<GenericValue> noargs;
-  GenericValue gv = EE->runFunction(FooF, noargs);
-
-  // Import result of execution:
-  outs() << "Result: " << gv.IntVal << "\n";
-  */
-  delete EE;
-  llvm_shutdown();
-  return 0;
+    delete ee;
+    llvm_shutdown();
+    return 0;
 }
