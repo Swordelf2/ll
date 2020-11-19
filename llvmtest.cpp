@@ -70,13 +70,11 @@ void optimize_module(ExecutionEngine *ee, Module *module) {
 
     legacy::PassManager* module_pass_manager(new legacy::PassManager());
     module_pass_manager->add(createTargetTransformInfoWrapperPass(target_analysis));
-    /* REMOVED FOR NOW
-    module_pass_manager->add(llvm::createInternalizePass([&exported_fn_names](const llvm::GlobalValue& gv) {
-        return exported_fn_names.find(gv.getName().str()) != exported_fn_names.end();
+    // TODO: If I say `false` here, all functions are removed from the module, why?
+    module_pass_manager->add(llvm::createInternalizePass([](const llvm::GlobalValue& gv) {
+        return true;
     }));
-    */
 
-    /* boost:: scoped_ptr<PassManager> module_pass_manager(new PassManager() */
     module_pass_manager->add(createGlobalDCEPass());
     module_pass_manager->run(*module);
     delete module_pass_manager;
